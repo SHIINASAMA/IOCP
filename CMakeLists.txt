@@ -3,4 +3,4 @@ project(IOCP)
 
 set(CMAKE_CXX_STANDARD 11)
 
-add_executable(IOCP main.cpp Server.cpp)
+add_executable(IOCP main.cpp)
