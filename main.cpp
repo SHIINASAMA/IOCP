@@ -1,4 +1,9 @@
-#pragma once
+/// \author kaoru
+/// \file main.cpp
+/// \version 0.2
+/// \date 2022.7.21
+/// \brief IOCP 示例
+
 #include <WinSock2.h>
 #pragma comment(lib, "ws2_32.lib")
 #include <WS2tcpip.h>
@@ -10,131 +15,187 @@
 constexpr static size_t MaxBufferSize = 1024 * 1;
 constexpr static size_t NumberOfThreads = 1;
 
-SOCKET server;
-HANDLE hIOCP;
+HANDLE hIOCP = INVALID_HANDLE_VALUE;
+SOCKET serverSocket = INVALID_SOCKET;
+std::vector<std::thread> threadGroup;
 std::atomic_bool isShutdown{false};
 
-enum class OperationType {
-    Send,
-    Recv
+// 此线程用于不断接收连接，并 Post 一次 Read 事件
+void AcceptWorkerThread();
+// 此线程用于不断处理 AcceptWorkerThread 所 Post 过来的事件
+void EventWorkerThread();
+
+// 用于标识事件的类型
+enum class IOType {
+    Read,
+    Write
 };
 
 struct IOContext {
     OVERLAPPED overlapped{};
-    SOCKET socket = INVALID_SOCKET;
     WSABUF wsaBuf{MaxBufferSize, buffer};
-    char buffer[MaxBufferSize]{};
-    OperationType operationType{};
-    DWORD totalBytes = 0;
+    CHAR buffer[MaxBufferSize]{};
+    IOType type{};
+    SOCKET socket = INVALID_SOCKET;
+    DWORD nBytes = 0;
 };
 
-void workerThread() {
-    IOContext *ioContext;
-    DWORD nBytes = MaxBufferSize;
-    DWORD dwFlags = 0;
-    DWORD dwIoContextSize;
+int main() {
+    // 初始化 Windows 网络库
+    WSAData data{};
+    WSAStartup(MAKEWORD(2, 2), &data);
+
+    struct sockaddr_in address {};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(8080);
+    inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
+
+    // 初始化 Socket
+    unsigned long ul = 1;
+    serverSocket = WSASocketW(AF_INET, SOCK_STREAM, 0, nullptr, 0, WSA_FLAG_OVERLAPPED);
+    if (INVALID_SOCKET == serverSocket) {
+        perror("FAILED TO CREATE SERVER SOCKET");
+        closesocket(serverSocket);
+        exit(-1);
+    }
+    if (SOCKET_ERROR == ioctlsocket(serverSocket, FIONBIO, &ul)) {
+        perror("FAILED TO SET NONBLOCKING SOCKET");
+        closesocket(serverSocket);
+        exit(-2);
+    }
+    if (SOCKET_ERROR == bind(serverSocket, (const struct sockaddr *) &address, sizeof(address))) {
+        perror("FAILED TO BIND ADDRESS");
+        closesocket(serverSocket);
+        exit(-3);
+    }
+    if (SOCKET_ERROR == listen(serverSocket, SOMAXCONN)) {
+        perror("FAILED TO LISTEN SOCKET");
+        closesocket(serverSocket);
+        exit(-4);
+    }
+
+    // 初始化 IOCP
+    hIOCP = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, NumberOfThreads);
+    if (INVALID_HANDLE_VALUE == hIOCP) {
+        perror("FAILED TO CREATE IOCP HANDLE");
+        closesocket(serverSocket);
+        exit(-5);
+    }
+
+    // 初始化工作线程
+    for (size_t i = 0; i < NumberOfThreads; i++) {
+        threadGroup.emplace_back(std::thread(EventWorkerThread));
+    }
+
     void *lpCompletionKey = nullptr;
+    auto acceptThread = std::thread(AcceptWorkerThread);
+    getchar();
+    // 按任意键进入退出程序
+    isShutdown = true;
+    // 有多少个线程就发送 post 多少次，让工作线程收到事件并主动退出
+    for (size_t i = 0; i < NumberOfThreads; i++) {
+        PostQueuedCompletionStatus(hIOCP, -1, (ULONG_PTR) lpCompletionKey, nullptr);
+    }
+    acceptThread.join();
+    for (auto &thread: threadGroup) {
+        thread.join();
+    }
+
+    WSACleanup();
+    return 0;
+}
+
+void AcceptWorkerThread() {
     while (!isShutdown) {
-        GetQueuedCompletionStatus(hIOCP, &dwIoContextSize, (PULONG_PTR) &lpCompletionKey, (LPOVERLAPPED *) &ioContext, INFINITE);
-        if (dwIoContextSize == 0) {
-            closesocket(ioContext->socket);
-            delete ioContext;
+        // 开始监听接入
+        SOCKET clientSocket = accept(serverSocket, nullptr, nullptr);
+        if (INVALID_SOCKET == clientSocket) continue;
+
+        unsigned long ul = 1;
+        if (SOCKET_ERROR == ioctlsocket(clientSocket, FIONBIO, &ul)) {
+            shutdown(clientSocket, SD_BOTH);
+            closesocket(clientSocket);
             continue;
         }
 
-        int32_t nRet;
-        switch (ioContext->operationType) {
-            case OperationType::Send:
-                nRet = WSASend(ioContext->socket,
-                               &(ioContext->wsaBuf),
-                               1,
-                               &nBytes,
-                               dwFlags,
-                               &(ioContext->overlapped),
-                               nullptr);
-                if (nRet == SOCKET_ERROR && ERROR_IO_PENDING != WSAGetLastError()) {
-                    perror("not io pending!!!");
-                    closesocket(ioContext->socket);
-                    delete ioContext;
-                }
-                break;
-            case OperationType::Recv:
-                nRet = WSARecv(
+        if (nullptr == CreateIoCompletionPort((HANDLE) clientSocket, hIOCP, 0, 0)) {
+            shutdown(clientSocket, SD_BOTH);
+            closesocket(clientSocket);
+            continue;
+        }
+
+        DWORD nBytes = MaxBufferSize;
+        DWORD dwFlags = 0;
+        auto ioContext = new IOContext;
+        ioContext->socket = clientSocket;
+        ioContext->type = IOType::Read;
+        auto rt = WSARecv(clientSocket, &ioContext->wsaBuf, 1, &nBytes, &dwFlags, &ioContext->overlapped, nullptr);
+        auto err = WSAGetLastError();
+        if (SOCKET_ERROR == rt && ERROR_IO_PENDING != err) {
+            // 发生不为 ERROR_IO_PENDING 的错误
+            shutdown(clientSocket, SD_BOTH);
+            closesocket(clientSocket);
+            delete ioContext;
+        }
+    }
+}
+
+void EventWorkerThread() {
+    IOContext *ioContext = nullptr;
+    DWORD lpNumberOfBytesTransferred = 0;
+    void *lpCompletionKey = nullptr;
+
+    DWORD dwFlags = 0;
+    DWORD nBytes = MaxBufferSize;
+
+    while (true) {
+        BOOL bRt = GetQueuedCompletionStatus(
+                hIOCP,
+                &lpNumberOfBytesTransferred,
+                (PULONG_PTR) &lpCompletionKey,
+                (LPOVERLAPPED *) &ioContext,
+                INFINITE);
+
+        if (!bRt) continue;
+
+        // 收到 PostQueuedCompletionStatus 发出的退出指令
+        if (lpNumberOfBytesTransferred == -1) break;
+
+        if (lpNumberOfBytesTransferred == 0) continue;
+
+        // 读到，或者写入的字节总数
+        ioContext->nBytes = lpNumberOfBytesTransferred;
+        // 处理对应的事件
+        switch (ioContext->type) {
+            case IOType::Read: {
+                int nRt = WSARecv(
                         ioContext->socket,
                         &ioContext->wsaBuf,
                         1,
                         &nBytes,
                         &dwFlags,
-                        &ioContext->overlapped,
+                        &(ioContext->overlapped),
                         nullptr);
-                if (nRet == SOCKET_ERROR && ERROR_IO_PENDING != WSAGetLastError()) {
-                    perror("not io pending!!!");
+                auto e = WSAGetLastError();
+                if (SOCKET_ERROR == nRt && e != WSAGetLastError()) {
+                    // 读取发生错误
                     closesocket(ioContext->socket);
                     delete ioContext;
+                    ioContext = nullptr;
+                } else {
+                    // 输出读取到的内容
+                    setbuf(stdout, nullptr);
+                    puts(ioContext->buffer);
+                    fflush(stdout);
+                    closesocket(ioContext->socket);
+                    delete ioContext;
+                    ioContext = nullptr;
                 }
+            }
+            case IOType::Write: {
+                // 此项目没有这方面的需求，故不处理
                 break;
+            }
         }
-    }
-}
-
-int main() {
-    // WSA 初始化
-    WSAData wsaData{};
-    WSAStartup(MAKEWORD(2, 2), &wsaData);
-
-    // socket 初始化
-    sockaddr_in serverAddress{};
-    serverAddress.sin_family = AF_INET;
-    serverAddress.sin_port = htons(8080);
-    inet_pton(AF_INET, "0.0.0.0", &serverAddress.sin_addr);
-
-    server = WSASocketW(AF_INET, SOCK_STREAM, 0, nullptr, 0, WSA_FLAG_OVERLAPPED);
-    if (-1 == bind(server, (const struct sockaddr *) &serverAddress, sizeof(sockaddr))) {
-        perror("failed to bind the address");
-        return -1;
-    }
-    listen(server, SOMAXCONN);
-
-    // 创建 IOCP
-    hIOCP = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, NumberOfThreads);
-    if (hIOCP == INVALID_HANDLE_VALUE) {
-        perror("failed to create hIOCP");
-        return -1;
-    }
-
-    // 创建对应线程
-    std::vector<std::thread> threadGroup;
-    for (int32_t i = 0; i < NumberOfThreads; i++) {
-        threadGroup.emplace_back(std::thread(workerThread));
-    }
-
-    while (true) {
-        SOCKET client = accept(server, nullptr, nullptr);
-
-        if (CreateIoCompletionPort((HANDLE) client, hIOCP, 0, 0) == nullptr) {
-            perror("failed to bind the client to an existing iocp");
-            closesocket(client);
-            continue;
-        }
-
-        auto data = new IOContext;
-        data->socket = client;
-        data->operationType = OperationType::Recv;
-
-        DWORD nBytes = MaxBufferSize;
-        DWORD dwFlags = 0;
-
-        int32_t nRet = WSARecv(client, &data->wsaBuf, 1, &nBytes, &dwFlags, &data->overlapped, nullptr);
-        if (nRet == SOCKET_ERROR && (ERROR_IO_PENDING != WSAGetLastError())) {
-            perror("not io pending!!!");
-            delete data;
-            continue;
-        }
-
-        setbuf(stdout, nullptr);
-        printf("%s\n\n", data->buffer);
-        fflush(stdout);
-        closesocket(client);
-//        delete data;
     }
 }
