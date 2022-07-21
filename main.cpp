@@ -191,6 +191,7 @@ void EventWorkerThread() {
                     delete ioContext;
                     ioContext = nullptr;
                 }
+                break;
             }
             case IOType::Write: {
                 // 此项目没有这方面的需求，故不处理
