@@ -12,7 +12,7 @@
 #include <thread>
 #include <vector>
 
-constexpr static size_t MaxBufferSize = 1024 * 1;
+constexpr static size_t MaxBufferSize = 1024 * 0.5;
 constexpr static size_t NumberOfThreads = 1;
 
 HANDLE hIOCP = INVALID_HANDLE_VALUE;
@@ -168,30 +168,31 @@ void EventWorkerThread() {
         // 处理对应的事件
         switch (ioContext->type) {
             case IOType::Read: {
-                int nRt = WSARecv(
-                        ioContext->socket,
-                        &ioContext->wsaBuf,
-                        1,
-                        &nBytes,
-                        &dwFlags,
-                        &(ioContext->overlapped),
-                        nullptr);
-                auto e = WSAGetLastError();
-                if (SOCKET_ERROR == nRt && e != WSAGetLastError()) {
-                    // 读取发生错误
-                    closesocket(ioContext->socket);
-                    delete ioContext;
-                    ioContext = nullptr;
-                } else {
-                    // 输出读取到的内容
-                    setbuf(stdout, nullptr);
-                    puts(ioContext->buffer);
-                    fflush(stdout);
-                    closesocket(ioContext->socket);
-                    delete ioContext;
-                    ioContext = nullptr;
+                // 输出读取到的内容
+                setbuf(stdout, nullptr);
+                puts(ioContext->buffer);
+                // fflush(stdout);
+                // closesocket(ioContext->socket);
+                // delete ioContext;
+                // ioContext = nullptr;
+                if (lpNumberOfBytesTransferred == MaxBufferSize) {
+                    puts("post read request again");
+                    int nRt = WSARecv(
+                            ioContext->socket,
+                            &ioContext->wsaBuf,
+                            1,
+                            &nBytes,
+                            &dwFlags,
+                            &(ioContext->overlapped),
+                            nullptr);
+                    auto e = WSAGetLastError();
+                    if (SOCKET_ERROR == nRt && e != WSAGetLastError()) {
+                        // 读取发生错误
+                        closesocket(ioContext->socket);
+                        delete ioContext;
+                        ioContext = nullptr;
+                    }
                 }
-                break;
             }
             case IOType::Write: {
                 // 此项目没有这方面的需求，故不处理
